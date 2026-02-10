@@ -1,0 +1,145 @@
+name: Auto Build & Release MAA (ARM64)
+
+permissions:
+  contents: write  # 🔥 必须开启，用于读取 Release 状态和发布新版本
+
+on:
+  workflow_dispatch: # 手动触发
+    inputs:
+      version_tag:
+        description: '指定版本号 (留空则检查最新)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 * * * *' # ⏰ 每小时整点检查
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      target_tag: ${{ steps.check.outputs.target_tag }}
+    steps:
+      - name: Get upstream latest tag
+        id: get_upstream
+        uses: oprypin/find-latest-tag@v1
+        with:
+          repository: MaaAssistantArknights/MaaAssistantArknights
+          releases-only: false  # ✅ 抓取包括 beta 在内的所有 tag
+
+      - name: Check if build is needed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # ✅ 自动使用 Token，避免 API 速率限制
+          INPUT_TAG: ${{ github.event.inputs.version_tag }}
+          UPSTREAM_TAG: ${{ steps.get_upstream.outputs.tag }}
+        run: |
+          # 1. 确定目标版本号
+          if [ -n "$INPUT_TAG" ]; then
+            TARGET="$INPUT_TAG"
+            echo "Trigger: Manual (Target: $TARGET)"
+            IS_MANUAL="true"
+          else
+            TARGET="$UPSTREAM_TAG"
+            echo "Trigger: Schedule (Target: $TARGET)"
+            IS_MANUAL="false"
+          fi
+          
+          echo "target_tag=$TARGET" >> $GITHUB_OUTPUT
+
+          # 2. 使用 gh cli 检查 Release 是否存在 (比 curl 更稳定)
+          echo "Checking if release $TARGET exists in ${{ github.repository }}..."
+          
+          if gh release view "$TARGET" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "✅ Release $TARGET already exists."
+            
+            # 如果是手动触发，允许覆盖/强制重编；如果是定时任务，则跳过
+            if [ "$IS_MANUAL" == "true" ]; then
+              echo "Force rebuild due to manual trigger."
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "⛔ Skipping build to save CPU time."
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ Release $TARGET not found."
+            echo "🚀 Starting new build..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true' # 🔥 关键：只有这里为 true 才运行
+    runs-on: ubuntu-22.04 # ✅ 兼容 Debian Bookworm (GLIBC 2.36)
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          repository: MaaAssistantArknights/MaaAssistantArknights
+          ref: ${{ needs.check-version.outputs.target_tag }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Determine Release Type
+        id: release_type
+        run: |
+          TAG="${{ needs.check-version.outputs.target_tag }}"
+          if [[ "$TAG" == *"beta"* ]] || [[ "$TAG" == *"alpha"* ]] || [[ "$TAG" == *"rc"* ]]; then
+            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+            echo "Type: Pre-release"
+          else
+            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+            echo "Type: Stable"
+          fi
+
+      - name: Install Cross-Compilation Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu build-essential python3-dev pkg-config wget tar
+
+      - name: Install Newer CMake
+        run: |
+          wget https://github.com/Kitware/CMake/releases/download/v3.31.5/cmake-3.31.5-linux-x86_64.tar.gz
+          tar -zxvf cmake-3.31.5-linux-x86_64.tar.gz
+          echo "${{ github.workspace }}/cmake-3.31.5-linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Download Deps (arm64-linux)
+        run: python3 tools/maadeps-download.py arm64-linux
+
+      - name: Patch Toolchain (Remove LLD Requirement)
+        run: sed -i '/CMAKE_LINKER_TYPE/d' src/MaaUtils/MaaDeps/cmake/maa-arm64-linux-toolchain.cmake
+
+      - name: Configure CMake
+        run: |
+          export CC=aarch64-linux-gnu-gcc
+          export CXX=aarch64-linux-gnu-g++
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DINSTALL_RESOURCE=ON \
+            -DINSTALL_PYTHON=ON \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_TOOLCHAIN_FILE=src/MaaUtils/MaaDeps/cmake/maa-arm64-linux-toolchain.cmake
+
+      - name: Build
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Package
+        run: |
+          cmake --install build --prefix ./dist
+          FILENAME="MAA-${{ needs.check-version.outputs.target_tag }}-ARM64-Release.tar.gz"
+          tar -zcvf $FILENAME -C dist .
+          echo "ASSET_PATH=$FILENAME" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.target_tag }}
+          name: MAA ${{ needs.check-version.outputs.target_tag }} for ARM64
+          body: |
+            Automatic build from upstream tag: ${{ needs.check-version.outputs.target_tag }}
+            Compatible with Debian Bookworm (GLIBC 2.36) and above.
+          files: ${{ env.ASSET_PATH }}
+          draft: false
+          prerelease: ${{ env.IS_PRERELEASE }}

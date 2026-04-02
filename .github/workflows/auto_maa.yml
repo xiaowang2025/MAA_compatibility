@@ -105,9 +105,13 @@ jobs:
             echo "Type: Stable"
           fi
 
+      - name: Enable arm64 architecture
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
@@ -119,7 +123,9 @@ jobs:
             tar \
             curl \
             git \
-            ca-certificates
+            ca-certificates \
+            libssl-dev:arm64 \
+            zlib1g-dev:arm64
 
       - name: Install newer CMake
         run: |
@@ -177,6 +183,17 @@ jobs:
           workspaces: |
             maa-cli -> target
 
+      - name: Show OpenSSL target files
+        run: |
+          echo "=== include ==="
+          ls -lah /usr/include/aarch64-linux-gnu || true
+          echo "=== openssl include ==="
+          ls -lah /usr/include/aarch64-linux-gnu/openssl || true
+          echo "=== lib ==="
+          ls -lah /usr/lib/aarch64-linux-gnu | grep -E 'ssl|crypto' || true
+          echo "=== pkgconfig ==="
+          ls -lah /usr/lib/aarch64-linux-gnu/pkgconfig | grep -E 'openssl|libssl' || true
+
       - name: Build maa-cli for aarch64
         working-directory: maa-cli
         env:
@@ -185,6 +202,11 @@ jobs:
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR: /
+          OPENSSL_INCLUDE_DIR: /usr/include/aarch64-linux-gnu
+          OPENSSL_LIB_DIR: /usr/lib/aarch64-linux-gnu
         run: |
           cargo build --release --target aarch64-unknown-linux-gnu
 
@@ -200,6 +222,10 @@ jobs:
           test -d dist/resource
           echo "=== dist contents ==="
           ls -lah dist
+
+      - name: Show linked libraries for maa
+        run: |
+          aarch64-linux-gnu-readelf -d dist/maa || true
 
       - name: Pack release tarball
         run: |
@@ -223,9 +249,10 @@ jobs:
             - Ubuntu 22.04
             - Target: aarch64 Linux GNU
 
-            Note:
+            Notes:
             - maa-cli is built from the standalone maa-cli project.
             - MaaCore/resources are built from the MaaAssistantArknights main repository.
+            - OpenSSL cross-compilation is configured with arm64 development headers and libraries.
           files: ${{ env.ASSET_PATH }}
           draft: false
           prerelease: ${{ env.IS_PRERELEASE }}

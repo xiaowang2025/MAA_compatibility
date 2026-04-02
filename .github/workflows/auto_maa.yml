@@ -46,11 +46,9 @@ jobs:
         run: |
           if [ -n "$INPUT_TAG" ]; then
             TARGET="$INPUT_TAG"
-            echo "Trigger: Manual (Target: $TARGET)"
             IS_MANUAL="true"
           else
             TARGET="$UPSTREAM_TAG"
-            echo "Trigger: Schedule (Target: $TARGET)"
             IS_MANUAL="false"
           fi
 
@@ -63,19 +61,13 @@ jobs:
           echo "target_tag=$TARGET" >> "$GITHUB_OUTPUT"
           echo "maa_cli_ref=$MAA_CLI_REF" >> "$GITHUB_OUTPUT"
 
-          echo "Checking if release $TARGET exists in ${{ github.repository }}..."
           if gh release view "$TARGET" --repo ${{ github.repository }} >/dev/null 2>&1; then
-            echo "✅ Release $TARGET already exists."
             if [ "$IS_MANUAL" = "true" ]; then
-              echo "Force rebuild due to manual trigger."
               echo "should_build=true" >> "$GITHUB_OUTPUT"
             else
-              echo "⛔ Skipping build to save CPU time."
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "❌ Release $TARGET not found."
-            echo "🚀 Starting new build..."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -103,27 +95,43 @@ jobs:
             echo "IS_PRERELEASE=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Enable arm64 architecture and fix apt sources
+      - name: Rebuild apt sources for amd64 + arm64
         shell: bash
         run: |
           set -euxo pipefail
 
           sudo dpkg --add-architecture arm64
 
-          # runner 上可能既有 .list 也有 .sources，这里统一把官方 Ubuntu 源限制为 amd64
+          # 先备份并移走 runner 自带的 Ubuntu 源，避免它继续错误拉 arm64 索引
+          sudo mkdir -p /etc/apt/backup-sources
           if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i 's|^deb |deb [arch=amd64] |g' /etc/apt/sources.list
+            sudo mv /etc/apt/sources.list /etc/apt/backup-sources/sources.list.bak
           fi
 
-          if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
-            for f in /etc/apt/sources.list.d/*.list; do
-              sudo sed -i 's|^deb \(http://.*ubuntu.*\) |deb [arch=amd64] \1 |g' "$f" || true
-              sudo sed -i 's|^deb \(https://.*ubuntu.*\) |deb [arch=amd64] \1 |g' "$f" || true
-            done
-          fi
+          shopt -s nullglob
+          for f in /etc/apt/sources.list.d/*; do
+            base="$(basename "$f")"
+            case "$base" in
+              microsoft-prod.list|azure-cli.list|docker.list|*.gpg|*.asc|*.key)
+                ;;
+              *)
+                sudo mv "$f" "/etc/apt/backup-sources/${base}.bak" || true
+                ;;
+            esac
+          done
+          shopt -u nullglob
 
-          # 给 arm64 单独添加 ports 源
-          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          # 自己写一份明确的 Ubuntu 官方源：
+          # amd64 走 archive/security
+          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/ubuntu-amd64.list
+          deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://azure.archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+          EOF
+
+          # arm64 只走 ports
+          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/ubuntu-arm64-ports.list
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
@@ -135,8 +143,8 @@ jobs:
       - name: Show apt sources
         shell: bash
         run: |
-          echo "=== /etc/apt/sources.list ==="
-          cat /etc/apt/sources.list || true
+          echo "=== /etc/apt ==="
+          ls -lah /etc/apt || true
           echo "=== /etc/apt/sources.list.d ==="
           ls -lah /etc/apt/sources.list.d || true
           for f in /etc/apt/sources.list.d/*; do
@@ -286,6 +294,7 @@ jobs:
             Notes:
             - maa-cli is built from the standalone maa-cli project.
             - MaaCore/resources are built from the MaaAssistantArknights main repository.
+            - ARM64 apt packages are fetched from Ubuntu Ports.
             - OpenSSL cross-compilation is configured with arm64 development headers and libraries.
           files: ${{ env.ASSET_PATH }}
           draft: false
